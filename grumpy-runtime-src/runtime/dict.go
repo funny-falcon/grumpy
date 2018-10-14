@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"reflect"
+	"runtime"
 	"sync/atomic"
 	"unsafe"
 )
@@ -28,7 +29,6 @@ var (
 	dictItemIteratorType  = newBasisType("dictionary-itemiterator", reflect.TypeOf(dictItemIterator{}), toDictItemIteratorUnsafe, ObjectType)
 	dictKeyIteratorType   = newBasisType("dictionary-keyiterator", reflect.TypeOf(dictKeyIterator{}), toDictKeyIteratorUnsafe, ObjectType)
 	dictValueIteratorType = newBasisType("dictionary-valueiterator", reflect.TypeOf(dictValueIterator{}), toDictValueIteratorUnsafe, ObjectType)
-	deletedEntry          = &dictEntry{}
 )
 
 const (
@@ -37,6 +37,8 @@ const (
 	// number representable as int32.
 	maxDictSize = 1 << 30
 	minDictSize = 8
+
+	uint32Mask = 0xffffffff
 )
 
 // dictEntry represents a slot in the hash table of a Dict. Entries are
@@ -47,25 +49,29 @@ type dictEntry struct {
 	value *Object
 }
 
+type hashEntry struct {
+	hash uint32
+	pos  uint32
+}
+
 // dictTable is the hash table underlying Dict.
 type dictTable struct {
+	// hashcapa is maks of hash part = capa * 2 - 1
+	hashmask uint32
+	// capa is entries capacity
+	capa uint32
 	// used is the number of slots in the entries table that contain values.
-	used int32
+	used uint32
 	// fill is the number of slots that are used or once were used but have
-	// since been cleared. Thus used <= fill <= len(entries).
-	fill int
-	// entries is a slice of immutable dict entries. Although elements in
-	// the slice will be modified to point to different dictEntry objects
-	// as the dictionary is updated, the slice itself (i.e. location in
-	// memory and size) will not change for the lifetime of a dictTable.
-	// When the table is no longer large enough to hold a dict's contents,
-	// a new dictTable will be created.
-	entries []*dictEntry
+	// since been cleared. Thus used <= fill <= capa
+	fill    uint32
+	hash    *[maxDictSize * 2]hashEntry
+	entries *[maxDictSize]dictEntry
 }
 
 // newDictTable allocates a table where at least minCapacity entries can be
 // accommodated. minCapacity must be <= maxDictSize.
-func newDictTable(minCapacity int) *dictTable {
+func newDictTable(minCapacity int) dictTable {
 	// This takes the given capacity and sets all bits less than the highest bit.
 	// Adding 1 to that value causes the number to become a multiple of 2 again.
 	// The minDictSize is mixed in to make sure the resulting value is at least
@@ -77,9 +83,20 @@ func newDictTable(minCapacity int) *dictTable {
 	numEntries |= numEntries >> 4
 	numEntries |= numEntries >> 8
 	numEntries |= numEntries >> 16
-	return &dictTable{entries: make([]*dictEntry, numEntries+1)}
+	numEntries++
+
+	dict := dictTable{
+		capa:     uint32(numEntries),
+		hashmask: uint32(numEntries)*2 - 1,
+	}
+	hash := make([]hashEntry, dict.hashmask+1)
+	entries := make([]dictEntry, dict.capa)
+	dict.hash = (*[maxDictSize * 2]hashEntry)(unsafe.Pointer(&hash[0]))
+	dict.entries = (*[maxDictSize]dictEntry)(unsafe.Pointer(&entries[0]))
+	return dict
 }
 
+/*
 // loadEntry atomically loads the i'th entry in t and returns it.
 func (t *dictTable) loadEntry(i int) *dictEntry {
 	p := (*unsafe.Pointer)(unsafe.Pointer(&t.entries[i]))
@@ -91,29 +108,58 @@ func (t *dictTable) storeEntry(i int, entry *dictEntry) {
 	p := (*unsafe.Pointer)(unsafe.Pointer(&t.entries[i]))
 	atomic.StorePointer(p, unsafe.Pointer(entry))
 }
+*/
+
+func (t *dictEntry) storeKey(v *Object) {
+	p := (*unsafe.Pointer)(unsafe.Pointer(&t.key))
+	atomic.StorePointer(p, unsafe.Pointer(v))
+}
+
+func (t *dictEntry) swapValue(v *Object) *Object {
+	p := (*unsafe.Pointer)(unsafe.Pointer(&t.value))
+	old := atomic.SwapPointer(p, unsafe.Pointer(v))
+	return (*Object)(unsafe.Pointer(old))
+}
+
+func (t *dictEntry) loadKey() *Object {
+	p := (*unsafe.Pointer)(unsafe.Pointer(&t.key))
+	old := atomic.LoadPointer(p)
+	return (*Object)(unsafe.Pointer(old))
+}
+
+func (t *dictEntry) loadValue() *Object {
+	p := (*unsafe.Pointer)(unsafe.Pointer(&t.value))
+	old := atomic.LoadPointer(p)
+	return (*Object)(unsafe.Pointer(old))
+}
 
 func (t *dictTable) loadUsed() int {
-	return int(atomic.LoadInt32(&t.used))
+	return int(atomic.LoadUint32(&t.used))
 }
 
 func (t *dictTable) incUsed(n int) {
-	atomic.AddInt32(&t.used, int32(n))
+	atomic.AddUint32(&t.used, uint32(n))
+}
+
+func smallHash(hash int) uint32 {
+	return uint32((uint64(hash&uint32Mask)*uint32Mask)>>32) + 1
 }
 
 // insertAbsentEntry adds the populated entry to t assuming that the key
 // specified in entry is absent from t. Since the key is absent, no key
 // comparisons are necessary to perform the insert.
 func (t *dictTable) insertAbsentEntry(entry *dictEntry) {
-	mask := uint(len(t.entries) - 1)
-	i := uint(entry.hash) & mask
-	perturb := uint(entry.hash)
-	index := i
+	mask := t.hashmask
+	h := smallHash(entry.hash)
+	perturb := uint32(entry.hash)
+	index := h & mask
 	// The key we're trying to insert is known to be absent from the dict
 	// so probe for the first nil entry.
-	for ; t.entries[index] != nil; index = i & mask {
-		i, perturb = dictNextIndex(i, perturb)
+	for ; t.hash[index].hash != 0; index = index & mask {
+		index, perturb = dictNextIndex(index, perturb)
 	}
-	t.entries[index] = entry
+	t.entries[t.fill] = *entry
+	t.hash[index] = hashEntry{hash: h, pos: t.fill}
 	t.incUsed(1)
 	t.fill++
 }
@@ -122,125 +168,111 @@ func (t *dictTable) insertAbsentEntry(entry *dictEntry) {
 // Elements in the table are updated with immutable entries atomically and
 // lookupEntry loads them atomically. So it is not necessary to lock the dict
 // to do entry lookups in a consistent way.
-func (t *dictTable) lookupEntry(f *Frame, hash int, key *Object) (int, *dictEntry, *BaseException) {
-	mask := uint(len(t.entries) - 1)
-	i, perturb := uint(hash)&mask, uint(hash)
-	// free is the first slot that's available. We don't immediately use it
-	// because it has been previously used and therefore an exact match may
-	// be found further on.
-	free := -1
-	var freeEntry *dictEntry
-	index := int(i & mask)
-	entry := t.loadEntry(index)
-	for {
-		if entry == nil {
-			if free != -1 {
-				index = free
-				// Store the entry instead of fetching by index
-				// later since it may have changed by then.
-				entry = freeEntry
-			}
-			break
-		}
-		if entry == deletedEntry {
-			if free == -1 {
-				free = index
-			}
-		} else if entry.hash == hash {
-			o, raised := Eq(f, entry.key, key)
-			if raised != nil {
-				return -1, nil, raised
-			}
-			eq, raised := IsTrue(f, o)
-			if raised != nil {
-				return -1, nil, raised
-			}
-			if eq {
-				break
-			}
-		}
-		i, perturb = dictNextIndex(i, perturb)
-		index = int(i & mask)
-		entry = t.loadEntry(index)
+func (t *dictTable) lookupEntry(f *Frame, hash int, key *Object) (*hashEntry, *dictEntry, uint32, *BaseException) {
+	if t.entries == nil {
+		return nil, nil, 0, nil
 	}
-	return index, entry, nil
+	mask := t.hashmask
+	h := smallHash(hash)
+	perturb := uint32(hash)
+	index := h & mask
+	for {
+		he := &t.hash[index]
+		entryh := atomic.LoadUint32(&he.hash)
+		if entryh == 0 {
+			return he, nil, 0, nil
+		}
+		if entryh == h {
+			index := atomic.LoadUint32(&he.pos)
+			entry := &t.entries[index]
+			if entry.hash == hash {
+				o, raised := Eq(f, entry.key, key)
+				if raised != nil {
+					return nil, nil, index, raised
+				}
+				eq, raised := IsTrue(f, o)
+				if raised != nil {
+					return nil, nil, index, raised
+				}
+				if eq {
+					return he, entry, index, nil
+				}
+			}
+		}
+		index, perturb = dictNextIndex(index, perturb)
+		index &= mask
+	}
 }
 
-// writeEntry replaces t's entry at the given index with entry. If writing
-// entry would cause t's fill ratio to grow too large then a new table is
-// created, the entry is instead inserted there and that table is returned. t
-// remains unchanged. When a sufficiently sized table cannot be created, false
-// will be returned for the second value, otherwise true will be returned.
-func (t *dictTable) writeEntry(f *Frame, index int, entry *dictEntry) (*dictTable, bool) {
-	if t.entries[index] == deletedEntry {
-		t.storeEntry(index, entry)
-		t.incUsed(1)
-		return nil, true
-	}
-	if t.entries[index] != nil {
-		t.storeEntry(index, entry)
-		return nil, true
-	}
-	if (t.fill+1)*3 <= len(t.entries)*2 {
-		// New entry does not necessitate growing the table.
-		t.storeEntry(index, entry)
-		t.incUsed(1)
-		t.fill++
-		return nil, true
-	}
-	// Grow the table.
-	var n int
-	if t.used <= 50000 {
-		n = int(t.used * 4)
-	} else if t.used <= maxDictSize/2 {
-		n = int(t.used * 2)
+func (t *dictTable) writeEntry(f *Frame, he *hashEntry, de *dictEntry, ei uint32, we dictEntry) {
+	var oldv *Object
+	if de.key == nil {
+		de.hash = we.hash
+		de.storeKey(we.key)
+		oldv = de.swapValue(we.value)
+		he.pos = ei
+		atomic.StoreUint32(&he.hash, smallHash(we.hash))
 	} else {
-		return nil, false
+		oldv = de.swapValue(we.value)
 	}
-	newTable := newDictTable(n)
-	for _, oldEntry := range t.entries {
-		if oldEntry != nil && oldEntry != deletedEntry {
-			newTable.insertAbsentEntry(oldEntry)
+	dlt := 0
+	if oldv == nil {
+		dlt++
+	}
+	if we.value == nil {
+		dlt--
+	}
+	if dlt != 0 {
+		t.incUsed(dlt)
+	}
+}
+
+func (t *dictTable) rehash() {
+	dt := newDictTable(int(t.used) + 1)
+	for i := uint32(0); i < t.capa; i++ {
+		entry := &t.entries[i]
+		if entry.value != nil {
+			dt.insertAbsentEntry(entry)
 		}
 	}
-	newTable.insertAbsentEntry(entry)
-	return newTable, true
+	*t = dt
 }
 
 // dictEntryIterator is used to iterate over the entries in a dictTable in an
 // arbitrary order.
 type dictEntryIterator struct {
-	index int64
-	table *dictTable
+	index   uint32
+	fill    uint32
+	entries *[maxDictSize]dictEntry
 }
 
 // newDictEntryIterator creates a dictEntryIterator object for d. It assumes
 // that d.mutex is held by the caller.
 func newDictEntryIterator(d *Dict) dictEntryIterator {
-	return dictEntryIterator{table: d.loadTable()}
+	di := dictEntryIterator{
+		fill:    d.table.fill,
+		entries: d.table.entries,
+	}
+	return di
 }
 
 // next advances this iterator to the next occupied entry and returns it. The
 // second return value is true if the dict changed since iteration began, false
 // otherwise.
-func (iter *dictEntryIterator) next() *dictEntry {
-	numEntries := len(iter.table.entries)
-	var entry *dictEntry
-	for entry == nil {
-		// 64bit atomic ops need to be 8 byte aligned. This compile time check
-		// verifies alignment by creating a negative constant for an unsigned type.
-		// See sync/atomic docs for details.
-		const blank = -(unsafe.Offsetof(iter.index) % 8)
-		index := int(atomic.AddInt64(&iter.index, 1)) - 1
-		if index >= numEntries {
-			break
+func (iter *dictEntryIterator) next() (key, value *Object) {
+	for {
+		next := atomic.AddUint32(&iter.index, 1) - 1
+		if next >= iter.fill {
+			atomic.AddUint32(&iter.index, ^uint32(0))
+			return nil, nil
 		}
-		entry = iter.table.loadEntry(index)
-		if entry == deletedEntry {
-			entry = nil
+		entry := &iter.entries[next]
+		value := entry.loadValue()
+		if value != nil {
+			key := entry.loadKey()
+			return key, value
 		}
 	}
-	return entry
 }
 
 // dictVersionGuard is used to detect when a dict has been modified.
@@ -263,7 +295,9 @@ func (g *dictVersionGuard) check() bool {
 // thread safe.
 type Dict struct {
 	Object
-	table *dictTable
+	// spin protects reading and writting of dictTable
+	spin  rwSpinLock
+	table dictTable
 	// We use a recursive mutex for synchronization because the hash and
 	// key comparison operations may re-enter DelItem/SetItem.
 	mutex recursiveMutex
@@ -281,8 +315,7 @@ func newStringDict(items map[string]*Object) *Dict {
 	if len(items) > maxDictSize/2 {
 		panic(fmt.Sprintf("dictionary too big: %d", len(items)))
 	}
-	n := len(items) * 2
-	table := newDictTable(n)
+	table := newDictTable(len(items))
 	for key, value := range items {
 		table.insertAbsentEntry(&dictEntry{hashString(key), NewStr(key).ToObject(), value})
 	}
@@ -291,18 +324,6 @@ func newStringDict(items map[string]*Object) *Dict {
 
 func toDictUnsafe(o *Object) *Dict {
 	return (*Dict)(o.toPointer())
-}
-
-// loadTable atomically loads and returns d's underlying dictTable.
-func (d *Dict) loadTable() *dictTable {
-	p := (*unsafe.Pointer)(unsafe.Pointer(&d.table))
-	return (*dictTable)(atomic.LoadPointer(p))
-}
-
-// storeTable atomically updates d's underlying dictTable to the one given.
-func (d *Dict) storeTable(table *dictTable) {
-	p := (*unsafe.Pointer)(unsafe.Pointer(&d.table))
-	atomic.StorePointer(p, unsafe.Pointer(table))
 }
 
 // loadVersion atomically loads and returns d's version.
@@ -346,14 +367,15 @@ func (d *Dict) GetItem(f *Frame, key *Object) (*Object, *BaseException) {
 	if raised != nil {
 		return nil, raised
 	}
-	_, entry, raised := d.loadTable().lookupEntry(f, hash.Value(), key)
-	if raised != nil {
+	d.spin.rlock()
+	table := d.table
+	d.spin.runlock()
+	_, entry, _, raised := table.lookupEntry(f, hash.Value(), key)
+	if raised != nil || entry == nil {
 		return nil, raised
 	}
-	if entry != nil && entry != deletedEntry {
-		return entry.value, nil
-	}
-	return nil, nil
+	value := entry.loadValue()
+	return value, nil
 }
 
 // GetItemString looks up key in d, returning the associated value or nil if
@@ -370,64 +392,95 @@ func (d *Dict) Pop(f *Frame, key *Object) (*Object, *BaseException) {
 
 // Keys returns a list containing all the keys in d.
 func (d *Dict) Keys(f *Frame) *List {
-	d.mutex.Lock(f)
-	keys := make([]*Object, d.Len())
-	i := 0
-	for _, entry := range d.table.entries {
-		if entry != nil && entry != deletedEntry {
-			keys[i] = entry.key
-			i++
+	d.spin.rlock()
+	fill := d.table.fill
+	used := d.table.used
+	entries := d.table.entries
+	d.spin.runlock()
+	keys := make([]*Object, 0, used)
+	for i := uint32(0); i < fill; i++ {
+		entry := &entries[i]
+		value := entry.loadValue()
+		if value != nil {
+			key := entry.loadKey()
+			keys = append(keys, key)
 		}
 	}
-	d.mutex.Unlock(f)
 	return NewList(keys...)
 }
 
 // Len returns the number of entries in d.
 func (d *Dict) Len() int {
-	return d.loadTable().loadUsed()
+	d.spin.rlock()
+	used := d.table.used
+	d.spin.runlock()
+	return int(used)
 }
 
 // putItem associates value with key in d, returning the old associated value if
 // the key was added, or nil if it was not already present in d.
 func (d *Dict) putItem(f *Frame, key, value *Object, overwrite bool) (*Object, *BaseException) {
-	hash, raised := Hash(f, key)
+	hashObj, raised := Hash(f, key)
 	if raised != nil {
 		return nil, raised
 	}
+	hash := hashObj.Value()
 	d.mutex.Lock(f)
 	t := d.table
 	v := d.version
-	index, entry, raised := t.lookupEntry(f, hash.Value(), key)
+	he, de, di, raised := t.lookupEntry(f, hash, key)
+	if raised != nil {
+		d.mutex.Unlock(f)
+		return nil, raised
+	}
+	if v != d.version {
+		// Dictionary was recursively modified. Blow up instead
+		// of trying to recover.
+		d.mutex.Unlock(f)
+		return nil, f.RaiseType(RuntimeErrorType, "dictionary changed during write")
+	}
 	var originValue *Object
-	if raised == nil {
-		if v != d.version {
-			// Dictionary was recursively modified. Blow up instead
-			// of trying to recover.
-			raised = f.RaiseType(RuntimeErrorType, "dictionary changed during write")
+	if de != nil {
+		originValue = de.value
+	}
+	changed := true
+	if originValue == nil {
+		if value == nil {
+			changed = false
+		} else if t.fill == t.capa {
+			t.rehash()
+			t.insertAbsentEntry(&dictEntry{
+				hash:  hash,
+				key:   key,
+				value: value,
+			})
 		} else {
-			if value == nil {
-				// Going to delete the entry.
-				if entry != nil && entry != deletedEntry {
-					d.table.storeEntry(index, deletedEntry)
-					d.table.incUsed(-1)
-					d.incVersion()
-				}
-			} else if overwrite || entry == nil {
-				newEntry := &dictEntry{hash.Value(), key, value}
-				if newTable, ok := t.writeEntry(f, index, newEntry); ok {
-					if newTable != nil {
-						d.storeTable(newTable)
-					}
-					d.incVersion()
-				} else {
-					raised = f.RaiseType(OverflowErrorType, errResultTooLarge)
-				}
-			}
-			if entry != nil && entry != deletedEntry {
-				originValue = entry.value
-			}
+			di = t.fill
+			de = &t.entries[t.fill]
+			t.fill++
+			t.writeEntry(f, he, de, di, dictEntry{
+				hash:  hash,
+				key:   key,
+				value: value,
+			})
 		}
+		originValue = nil
+	} else if overwrite {
+		used := t.used
+		t.writeEntry(f, he, de, di, dictEntry{
+			hash:  hash,
+			key:   key,
+			value: value,
+		})
+		changed = used != t.used
+	} else {
+		changed = false
+	}
+	if changed {
+		d.spin.wlock()
+		d.table = t
+		d.incVersion()
+		d.spin.wunlock()
 	}
 	d.mutex.Unlock(f)
 	return originValue, raised
@@ -454,11 +507,9 @@ func (d *Dict) Update(f *Frame, o *Object) (raised *BaseException) {
 	var iter *Object
 	if o.isInstance(DictType) {
 		d2 := toDictUnsafe(o)
-		d2.mutex.Lock(f)
-		// Concurrent modifications to d2 will cause Update to raise
-		// "dictionary changed during iteration".
+		d.spin.rlock()
 		iter = newDictItemIterator(d2).ToObject()
-		d2.mutex.Unlock(f)
+		d.spin.runlock()
 	} else {
 		iter, raised = Iter(f, o)
 	}
@@ -483,27 +534,26 @@ func dictsAreEqual(f *Frame, d1, d2 *Dict) (bool, *BaseException) {
 	if d1 == d2 {
 		return true, nil
 	}
-	// Do not hold both locks at the same time to avoid deadlock.
-	d1.mutex.Lock(f)
+	d1.spin.rlock()
 	iter := newDictEntryIterator(d1)
 	g1 := newDictVersionGuard(d1)
-	len1 := d1.Len()
-	d1.mutex.Unlock(f)
-	d2.mutex.Lock(f)
-	g2 := newDictVersionGuard(d1)
-	len2 := d2.Len()
-	d2.mutex.Unlock(f)
+	len1 := d1.table.used
+	d1.spin.runlock()
+	d2.spin.rlock()
+	g2 := newDictVersionGuard(d2)
+	len2 := d2.table.used
+	d2.spin.runlock()
 	if len1 != len2 {
 		return false, nil
 	}
 	result := true
-	for entry := iter.next(); entry != nil && result; entry = iter.next() {
-		if v, raised := d2.GetItem(f, entry.key); raised != nil {
+	for key, value := iter.next(); key != nil && result; key, value = iter.next() {
+		if v, raised := d2.GetItem(f, key); raised != nil {
 			return false, raised
 		} else if v == nil {
 			result = false
 		} else {
-			eq, raised := Eq(f, entry.value, v)
+			eq, raised := Eq(f, value, v)
 			if raised != nil {
 				return false, raised
 			}
@@ -524,10 +574,10 @@ func dictClear(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
 		return nil, raised
 	}
 	d := toDictUnsafe(args[0])
-	d.mutex.Lock(f)
+	d.spin.rlock()
 	d.table = newDictTable(0)
 	d.incVersion()
-	d.mutex.Unlock(f)
+	d.spin.runlock()
 	return None, nil
 }
 
@@ -599,9 +649,9 @@ func dictItems(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
 		return nil, raised
 	}
 	d := toDictUnsafe(args[0])
-	d.mutex.Lock(f)
+	d.spin.rlock()
 	iter := newDictItemIterator(d).ToObject()
-	d.mutex.Unlock(f)
+	d.spin.runlock()
 	return ListType.Call(f, Args{iter}, nil)
 }
 
@@ -610,9 +660,9 @@ func dictIterItems(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException)
 		return nil, raised
 	}
 	d := toDictUnsafe(args[0])
-	d.mutex.Lock(f)
+	d.spin.rlock()
 	iter := newDictItemIterator(d).ToObject()
-	d.mutex.Unlock(f)
+	d.spin.runlock()
 	return iter, nil
 }
 
@@ -628,9 +678,9 @@ func dictIterValues(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException
 		return nil, raised
 	}
 	d := toDictUnsafe(args[0])
-	d.mutex.Lock(f)
+	d.spin.rlock()
 	iter := newDictValueIterator(d).ToObject()
-	d.mutex.Unlock(f)
+	d.spin.runlock()
 	return iter, nil
 }
 
@@ -677,9 +727,9 @@ func dictInit(f *Frame, o *Object, args Args, kwargs KWArgs) (*Object, *BaseExce
 
 func dictIter(f *Frame, o *Object) (*Object, *BaseException) {
 	d := toDictUnsafe(o)
-	d.mutex.Lock(f)
+	d.spin.rlock()
 	iter := newDictKeyIterator(d).ToObject()
-	d.mutex.Unlock(f)
+	d.spin.runlock()
 	return iter, nil
 }
 
@@ -702,7 +752,6 @@ func dictNE(f *Frame, v, w *Object) (*Object, *BaseException) {
 
 func dictNew(f *Frame, t *Type, _ Args, _ KWArgs) (*Object, *BaseException) {
 	d := toDictUnsafe(newObject(t))
-	d.table = &dictTable{entries: make([]*dictEntry, minDictSize, minDictSize)}
 	return d.ToObject(), nil
 }
 
@@ -734,15 +783,23 @@ func dictPopItem(f *Frame, args Args, _ KWArgs) (item *Object, raised *BaseExcep
 	}
 	d := toDictUnsafe(args[0])
 	d.mutex.Lock(f)
-	iter := newDictEntryIterator(d)
-	entry := iter.next()
-	if entry == nil {
+	if d.table.used == 0 {
 		raised = f.RaiseType(KeyErrorType, "popitem(): dictionary is empty")
 	} else {
-		item = NewTuple(entry.key, entry.value).ToObject()
-		d.table.storeEntry(int(iter.index-1), deletedEntry)
-		d.table.incUsed(-1)
-		d.incVersion()
+		// python 3.7 forces popitem to LIFO order.
+		for i := d.table.fill; i > 0; {
+			i--
+			entry := &d.table.entries[i]
+			value := entry.swapValue(nil)
+			if value != nil {
+				item = NewTuple2(entry.key, value).ToObject()
+				d.spin.wlock()
+				d.table.incUsed(-1)
+				d.incVersion()
+				d.spin.wunlock()
+				break
+			}
+		}
 	}
 	d.mutex.Unlock(f)
 	return item, raised
@@ -762,17 +819,17 @@ func dictRepr(f *Frame, o *Object) (*Object, *BaseException) {
 	buf.WriteString("{")
 	iter := newDictEntryIterator(d)
 	i := 0
-	for entry := iter.next(); entry != nil; entry = iter.next() {
+	for key, value := iter.next(); key != nil; key, value = iter.next() {
 		if i > 0 {
 			buf.WriteString(", ")
 		}
-		s, raised := Repr(f, entry.key)
+		s, raised := Repr(f, key)
 		if raised != nil {
 			return nil, raised
 		}
 		buf.WriteString(s.Value())
 		buf.WriteString(": ")
-		if s, raised = Repr(f, entry.value); raised != nil {
+		if s, raised = Repr(f, value); raised != nil {
 			return nil, raised
 		}
 		buf.WriteString(s.Value())
@@ -909,11 +966,11 @@ func dictItemIteratorIter(f *Frame, o *Object) (*Object, *BaseException) {
 
 func dictItemIteratorNext(f *Frame, o *Object) (ret *Object, raised *BaseException) {
 	iter := toDictItemIteratorUnsafe(o)
-	entry, raised := dictIteratorNext(f, &iter.iter, &iter.guard)
+	key, value, raised := dictIteratorNext(f, &iter.iter, &iter.guard)
 	if raised != nil {
 		return nil, raised
 	}
-	return NewTuple2(entry.key, entry.value).ToObject(), nil
+	return NewTuple2(key, value).ToObject(), nil
 }
 
 func initDictItemIteratorType(map[string]*Object) {
@@ -952,11 +1009,8 @@ func dictKeyIteratorIter(f *Frame, o *Object) (*Object, *BaseException) {
 
 func dictKeyIteratorNext(f *Frame, o *Object) (*Object, *BaseException) {
 	iter := toDictKeyIteratorUnsafe(o)
-	entry, raised := dictIteratorNext(f, &iter.iter, &iter.guard)
-	if raised != nil {
-		return nil, raised
-	}
-	return entry.key, nil
+	key, _, raised := dictIteratorNext(f, &iter.iter, &iter.guard)
+	return key, raised
 }
 
 func initDictKeyIteratorType(map[string]*Object) {
@@ -995,11 +1049,8 @@ func dictValueIteratorIter(f *Frame, o *Object) (*Object, *BaseException) {
 
 func dictValueIteratorNext(f *Frame, o *Object) (*Object, *BaseException) {
 	iter := toDictValueIteratorUnsafe(o)
-	entry, raised := dictIteratorNext(f, &iter.iter, &iter.guard)
-	if raised != nil {
-		return nil, raised
-	}
-	return entry.value, nil
+	_, value, raised := dictIteratorNext(f, &iter.iter, &iter.guard)
+	return value, raised
 }
 
 func initDictValueIteratorType(map[string]*Object) {
@@ -1016,22 +1067,74 @@ func raiseKeyError(f *Frame, key *Object) *BaseException {
 	return raised
 }
 
-func dictNextIndex(i, perturb uint) (uint, uint) {
+func dictNextIndex(i uint32, perturb uint32) (uint32, uint32) {
 	return (i << 2) + i + perturb + 1, perturb >> 5
 }
 
-func dictIteratorNext(f *Frame, iter *dictEntryIterator, guard *dictVersionGuard) (*dictEntry, *BaseException) {
+func dictIteratorNext(f *Frame, iter *dictEntryIterator, guard *dictVersionGuard) (*Object, *Object, *BaseException) {
 	// NOTE: The behavior here diverges from CPython where an iterator that
 	// is exhausted will always return StopIteration regardless whether the
 	// underlying dict is subsequently modified. In Grumpy, an iterator for
 	// a dict that has been modified will always raise RuntimeError even if
 	// the iterator was exhausted before the modification.
-	entry := iter.next()
+	key, value := iter.next()
 	if !guard.check() {
-		return nil, f.RaiseType(RuntimeErrorType, "dictionary changed during iteration")
+		return nil, nil, f.RaiseType(RuntimeErrorType, "dictionary changed during iteration")
 	}
-	if entry == nil {
-		return nil, f.Raise(StopIterationType.ToObject(), nil, nil)
+	if key == nil {
+		return nil, nil, f.Raise(StopIterationType.ToObject(), nil, nil)
 	}
-	return entry, nil
+	return key, value, nil
+}
+
+// http://joeduffyblog.com/2009/01/29/a-singleword-readerwriter-spin-lock/
+type rwSpinLock struct{ l int32 }
+
+const rwSpinWaitBit = 1
+const rwSpinWriterBit = 2
+const rwSpinWriterBits = 3
+const rwSpinReaderAdd = 4
+
+func (spin *rwSpinLock) rlock() {
+	l := atomic.AddInt32(&spin.l, rwSpinReaderAdd)
+	if l&rwSpinWriterBits == 0 {
+		return
+	}
+	l = atomic.AddInt32(&spin.l, -rwSpinReaderAdd)
+	for {
+		if l&rwSpinWriterBits == 0 {
+			if atomic.CompareAndSwapInt32(&spin.l, l, l+rwSpinReaderAdd) {
+				break
+			}
+		} else {
+			runtime.Gosched()
+		}
+		l = atomic.LoadInt32(&spin.l)
+	}
+}
+
+func (spin *rwSpinLock) runlock() {
+	atomic.AddInt32(&spin.l, -rwSpinReaderAdd)
+}
+
+func (spin *rwSpinLock) wlock() {
+	for {
+		l := atomic.LoadInt32(&spin.l)
+		if l < rwSpinWriterBit {
+			if atomic.CompareAndSwapInt32(&spin.l, l, rwSpinWriterBit) {
+				break
+			}
+			continue
+		}
+		if l&rwSpinWaitBit == 0 {
+			if !atomic.CompareAndSwapInt32(&spin.l, l, l|rwSpinWaitBit) {
+				continue
+			}
+		}
+		runtime.Gosched()
+	}
+}
+
+func (spin *rwSpinLock) wunlock() {
+	atomic.AddInt32(&spin.l, -rwSpinWriterBit)
 }

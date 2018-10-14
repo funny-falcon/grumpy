@@ -181,9 +181,9 @@ func setIsSuperset(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
 
 func setIter(f *Frame, o *Object) (*Object, *BaseException) {
 	s := toSetUnsafe(o)
-	s.dict.mutex.Lock(f)
+	s.dict.spin.rlock()
 	iter := &newDictKeyIterator(s.dict).Object
-	s.dict.mutex.Unlock(f)
+	s.dict.spin.runlock()
 	return iter, nil
 }
 
@@ -311,9 +311,9 @@ func frozenSetIsSuperset(f *Frame, args Args, _ KWArgs) (*Object, *BaseException
 
 func frozenSetIter(f *Frame, o *Object) (*Object, *BaseException) {
 	s := toFrozenSetUnsafe(o)
-	s.dict.mutex.Lock(f)
+	s.dict.spin.rlock()
 	iter := &newDictKeyIterator(s.dict).Object
-	s.dict.mutex.Unlock(f)
+	s.dict.spin.runlock()
 	return iter, nil
 }
 
@@ -388,15 +388,15 @@ func setCompare(f *Frame, op compareOp, v *setBase, w *Object) (*Object, *BaseEx
 		op = op.swapped()
 		v, s2 = s2, v
 	}
-	v.dict.mutex.Lock(f)
+	v.dict.spin.rlock()
 	iter := newDictEntryIterator(v.dict)
 	g1 := newDictVersionGuard(v.dict)
-	len1 := v.dict.Len()
-	v.dict.mutex.Unlock(f)
-	s2.dict.mutex.Lock(f)
+	len1 := v.dict.table.used
+	v.dict.spin.runlock()
+	s2.dict.spin.rlock()
 	g2 := newDictVersionGuard(s2.dict)
-	len2 := s2.dict.Len()
-	s2.dict.mutex.Unlock(f)
+	len2 := s2.dict.table.used
+	s2.dict.spin.runlock()
 	result := (op != compareOpNE)
 	switch op {
 	case compareOpLT:
@@ -412,8 +412,8 @@ func setCompare(f *Frame, op compareOp, v *setBase, w *Object) (*Object, *BaseEx
 			return GetBool(!result).ToObject(), nil
 		}
 	}
-	for entry := iter.next(); entry != nil; entry = iter.next() {
-		contains, raised := s2.contains(f, entry.key)
+	for key, _ := iter.next(); key != nil; key, _ = iter.next() {
+		contains, raised := s2.contains(f, key)
 		if raised != nil {
 			return nil, raised
 		}
